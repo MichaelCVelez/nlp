@@ -1,4 +1,12 @@
+# Assignment 1 Fall 2025
+# Note: ChatGPT used to understand concepts and as a coding assistant
+# - Michael Velez
+
 # models.py
+import re
+from collections import Counter
+import numpy as np
+import random
 
 from sentiment_data import *
 from utils import *
@@ -27,11 +35,61 @@ class FeatureExtractor(object):
 
 class UnigramFeatureExtractor(FeatureExtractor):
     """
-    Extracts unigram bag-of-words features from a sentence. It's up to you to decide how you want to handle counts
-    and any additional preprocessing you want to do.
+    Extracts unigram bag-of-words features from a sentence.
     """
-    def __init__(self, indexer: Indexer):
-        raise Exception("Must be implemented")
+    def __init__(self, indexer):
+        # store the provided Indexer
+        self._indexer = indexer
+
+    def get_indexer(self):
+        return self._indexer
+
+    def _normalize_token(self, tok: str) -> str:
+        # lowercase and strip leading/trailing punctuation
+        if tok is None:
+            return ""
+        t = tok.lower()
+        # remove leading/trailing non-alphanumeric characters
+        t = re.sub(r'^\W+|\W+$', '', t)
+        return t
+
+    def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
+        """
+        Returns a Counter mapping feature_index (int) -> value (float).
+        :param sentence: words in the example to featurize
+        :param add_to_indexer: True if we should grow the dimensionality of the featurizer if new features are encountered.
+        """
+        feats = Counter()
+        seen = set()  # use presence-level features (1 or 0)
+        for tok in sentence:
+            t = self._normalize_token(tok)
+            if not t:
+                continue
+            if t in seen: #skip remaining loop since presence already accounted for
+                continue
+            seen.add(t)
+
+            feat_name = f"UNI={t}"
+            # New features to be added
+            if add_to_indexer:
+                try:
+                    idx = self._indexer.add_and_get_index(feat_name)
+                except Exception as e:
+                    raise RuntimeError("Indexer does not implement add_and_get_index in utils.py") from e
+            else:
+                # Get the existing index
+                try:
+                    idx = self._indexer.index_of(feat_name)
+                except Exception as e:
+                    raise RuntimeError("Indexer does not implement get_index; inspect utils.py and update this call") from e
+
+                # if indexer returns -1, None, or a negative value for missing features, skip
+                if idx is None or (isinstance(idx, int) and idx < 0):
+                    continue
+
+            feats[idx] += 1.0   # 1.0 = presence
+
+        return feats
 
 
 class BigramFeatureExtractor(FeatureExtractor):
@@ -72,13 +130,23 @@ class TrivialSentimentClassifier(SentimentClassifier):
 
 class PerceptronClassifier(SentimentClassifier):
     """
-    Implement this class -- you should at least have init() and implement the predict method from the SentimentClassifier
-    superclass. Hint: you'll probably need this class to wrap both the weight vector and featurizer -- feel free to
-    modify the constructor to pass these in.
+    Wraps a weight vector (numpy array) and a feature extractor.
+    Predicts 1 if score > 0 else 0.
     """
-    def __init__(self):
-        raise Exception("Must be implemented")
+    def __init__(self, weights: np.ndarray, feat_extractor: FeatureExtractor):
+        self.weights = weights
+        self.feat_extractor = feat_extractor
 
+    def predict(self, sentence: List[str]) -> int:
+        # extract features w/o growing the indexer
+        feats = self.feat_extractor.extract_features(sentence, add_to_indexer=False)
+        score = 0.0
+        # Perform dot product and make prediction
+        for idx, val in feats.items():
+            if idx < 0 or idx >= self.weights.shape[0]:
+                continue
+            score += self.weights[idx] * val
+        return 1 if score > 0.0 else 0
 
 class LogisticRegressionClassifier(SentimentClassifier):
     """
@@ -97,7 +165,67 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
     :param feat_extractor: feature extractor to use
     :return: trained PerceptronClassifier model
     """
-    raise Exception("Must be implemented")
+    # Hyperparameters
+    NUM_EPOCHS = 10
+    INITIAL_LEARNING_RATE = 1.0
+
+    # Pre-extract features
+    features_cache = []
+    max_index = -1
+    for ex in train_exs:
+        feats = feat_extractor.extract_features(ex.words, add_to_indexer=True)
+        features_cache.append(feats)
+        if len(feats) > 0:
+            max_index = max(max_index, max(feats.keys()))
+
+    dim = max_index + 1 if max_index >= 0 else 0
+    # initialize weights
+    weights = np.zeros(dim, dtype=float)
+
+    # Uncomment for fixed randomness during dev
+    # random.seed(0)
+
+    for epoch in range(NUM_EPOCHS):
+        # adjust learning rate (slight decay) 
+        eta = INITIAL_LEARNING_RATE / (1.0 + epoch * 0.1)
+        # shuffle indices for random order each epoch
+        indices = list(range(len(train_exs)))
+        random.shuffle(indices)
+
+        for i in indices:
+            # feats maps idx -> val.
+            feats = features_cache[i]
+            # compute score using sparse dot product
+            score = 0.0
+            for idx, val in feats.items():
+                if 0 <= idx < weights.shape[0]:
+                    score += weights[idx] * val
+            # Map gold label 0/1 to perceptron targets y = -1 or +1
+            gold_label = train_exs[i].label
+            y = 1 if gold_label == 1 else -1
+            # Predicted label
+            pred_y = 1 if score > 0.0 else -1
+
+            if pred_y != y:
+                # Update weights: w <- w + eta * y * x
+                for idx, val in feats.items():
+                    if 0 <= idx < weights.shape[0]:
+                        weights[idx] += eta * y * val
+
+        # compute training accuracy
+        correct = 0
+        for j, ex in enumerate(train_exs):
+            feats = features_cache[j]
+            s = sum(weights[idx] * val for idx, val in feats.items() if 0 <= idx < weights.shape[0])
+            pred = 1 if s > 0.0 else 0
+            if pred == ex.label:
+                correct += 1
+        # Print epoch, train accuracy and eta
+        train_acc = correct / len(train_exs)
+        print(f"[Epoch {epoch+1}/{NUM_EPOCHS}] train_acc={train_acc:.4f} eta={eta:.4f}")
+
+    # wrap in classifier and return
+    return PerceptronClassifier(weights, feat_extractor)
 
 
 def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor: FeatureExtractor) -> LogisticRegressionClassifier:
