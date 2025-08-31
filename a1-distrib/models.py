@@ -36,9 +36,9 @@ class FeatureExtractor(object):
 class UnigramFeatureExtractor(FeatureExtractor):
     """
     Extracts unigram bag-of-words features from a sentence.
+    :param indexer: the provided feature extractor indexer.
     """
     def __init__(self, indexer):
-        # store the provided Indexer
         self._indexer = indexer
 
     def get_indexer(self):
@@ -56,16 +56,18 @@ class UnigramFeatureExtractor(FeatureExtractor):
     def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
         """
         Returns a Counter mapping feature_index (int) -> value (float).
-        :param sentence: words in the example to featurize
-        :param add_to_indexer: True if we should grow the dimensionality of the featurizer if new features are encountered.
+        :param sentence: list of stirngs to extract features from
+        :param add_to_indexer: Optional boolean used to grow the dimensionality of the featurizer
         """
         feats = Counter()
-        seen = set()  # use presence-level features (1 or 0)
+        # Using presence-level features (1 or 0)
+        seen = set()
         for tok in sentence:
             t = self._normalize_token(tok)
             if not t:
                 continue
-            if t in seen: #skip remaining loop since presence already accounted for
+            if t in seen:
+                #skip remaining loop since presence already accounted for
                 continue
             seen.add(t)
 
@@ -86,8 +88,8 @@ class UnigramFeatureExtractor(FeatureExtractor):
                 # if indexer returns -1, None, or a negative value for missing features, skip
                 if idx is None or (isinstance(idx, int) and idx < 0):
                     continue
-
-            feats[idx] += 1.0   # 1.0 = presence
+            # 1.0 to signify presence
+            feats[idx] += 1.0
 
         return feats
 
@@ -148,14 +150,60 @@ class PerceptronClassifier(SentimentClassifier):
             score += self.weights[idx] * val
         return 1 if score > 0.0 else 0
 
+
 class LogisticRegressionClassifier(SentimentClassifier):
     """
-    Implement this class -- you should at least have init() and implement the predict method from the SentimentClassifier
-    superclass. Hint: you'll probably need this class to wrap both the weight vector and featurizer -- feel free to
-    modify the constructor to pass these in.
+    Logistic regression classifier wraps weight vector and featurizer.
+    :param weights: 1D numpy array of size = number of features
+    :param feat_extractor: the FeatureExtractor for producing feature indices
     """
-    def __init__(self):
-        raise Exception("Must be implemented")
+    def __init__(self, weights: np.ndarray, feat_extractor: FeatureExtractor):
+        self.weights = weights
+        self.feat_extractor = feat_extractor
+
+    def _score(self, sentence: List[str]) -> float:
+        """
+        Compute the linear score w · x for a sentence.
+        :param sentence: List of strings to be scored
+        :return: float: sparse dot procut score
+        """
+        feats = self.feat_extractor.extract_features(sentence, add_to_indexer=False)
+        s = 0.0
+        # Perform sparse dot product
+        for idx, val in feats.items():
+            # skip any feature indices that are out of bounds
+            if 0 <= idx < self.weights.shape[0]:
+                s += self.weights[idx] * val
+        return s
+
+    def _sigmoid(self, x: float) -> float:
+        """
+        Numerically stable sigmoid function. 
+        :param x: raw score value (w · x).
+        :return: float: Sigmoid output representing probability (between 0 and 1).
+        """
+        if x >= 0:
+          return 1.0 / (1.0 + np.exp(-x))
+        else:
+          return np.exp(x) / (np.exp(x) + 1.0)
+
+    def predict_scores(self, sentence: List[str]) -> float:
+        """
+        Compute probability that sentence belongs to the positive class.
+        :param sentence: sentence tokenized into words.
+        :return: float: Probability between 0 and 1.
+        """
+        s = self._score(sentence)
+        return self._sigmoid(s)
+
+    def predict(self, sentence: List[str]) -> int:
+        """
+        Returns binary prediction of 0 or 1 with a threshold of 0.5.
+        :param sentence: sentence tokenized into words.
+        :return: int: Predicted class label (0 = negative, 1 = positive).
+        """
+        p = self.predict_scores(sentence)
+        return 1 if p >= 0.5 else 0
 
 
 def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureExtractor) -> PerceptronClassifier:
@@ -235,7 +283,53 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
     :param feat_extractor: feature extractor to use
     :return: trained LogisticRegressionClassifier model
     """
-    raise Exception("Must be implemented")
+    # Hyperparameters
+    NUM_EPOCHS = 10
+    LEARNING_RATE = 0.1
+
+    # Pre-extract features for all training examples
+    features_cache = []
+    max_index = -1
+    for ex in train_exs:
+        # add new features to indexer
+        feats = feat_extractor.extract_features(ex.words, add_to_indexer=True)
+        features_cache.append(feats)
+        if len(feats) > 0:
+            max_index = max(max_index, max(feats.keys()))
+    
+    # set weight vector dimensionality and intialize weights
+    dim = max_index + 1 if max_index >= 0 else 0
+    weights = np.zeros(dim, dtype=float)
+
+    # Wrap weights + feature extractor in classifier 
+    clf = LogisticRegressionClassifier(weights, feat_extractor)
+
+    # Training loop
+    for epoch in range(NUM_EPOCHS):
+        indices = list(range(len(train_exs)))
+        # shuffle training order
+        random.shuffle(indices)
+
+        for i in indices:
+            feats = features_cache[i]
+            # gold label (0 or 1)
+            y = train_exs[i].label
+
+            # Compute probability
+            score = clf._score(train_exs[i].words)
+            p = clf._sigmoid(score)
+
+            # Gradient update: w <- w + lr * (y - p) * x
+            for idx, val in feats.items():
+                if 0 <= idx < clf.weights.shape[0]:
+                    clf.weights[idx] += LEARNING_RATE * (y - p) * val
+
+        # Print training accuracy
+        correct = sum(1 for ex in train_exs if clf.predict(ex.words) == ex.label)
+        train_acc = correct / len(train_exs)
+        print(f"[Epoch {epoch+1}/{NUM_EPOCHS}] train_acc={train_acc:.4f}")
+
+    return clf
 
 
 def train_model(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample]) -> SentimentClassifier:
