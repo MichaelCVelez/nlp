@@ -1,17 +1,40 @@
-# Assignment 1 Fall 2025
-# Note: ChatGPT used to understand concepts and as a coding assistant
+# Assignment 1 Fall 2025 
+# Note: ChatGPT used to understand concepts and as a coding assistant 
 # - Michael Velez
 
-# models.py
 import re
 from collections import Counter
 import numpy as np
 import random
 
+# Download stopwords
+import nltk
+from nltk.corpus import stopwords
+nltk.download('stopwords')
+
 from sentiment_data import *
 from utils import *
 
-from collections import Counter
+
+# ---------------- Helper functions (new, added for modularity) ----------------
+def normalize_token(tok: str) -> str:
+    # lowercase and strip leading/trailing punctuation
+    if tok is None:
+        return ""
+    t = tok.lower()
+    # remove leading/trailing non-alphanumeric characters
+    t = re.sub(r'^\W+|\W+$', '', t)
+    return t
+
+
+def add_feature(feat_name: str, indexer, add_to_indexer: bool) -> int:
+    # Add or lookup feature index depending on mode
+    if add_to_indexer:
+        return indexer.add_and_get_index(feat_name)
+    else:
+        return indexer.index_of(feat_name)
+# -------------------------------------------------------------------------------
+
 
 class FeatureExtractor(object):
     """
@@ -20,15 +43,18 @@ class FeatureExtractor(object):
     def get_indexer(self):
         raise Exception("Don't call me, call my subclasses")
 
-    def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
+    def extract_features(self, sentence: List[str], add_to_indexer: bool = False) -> Counter:
         """
-        Extract features from a sentence represented as a list of words. Includes a flag add_to_indexer to
+        Extract features from a sentence represented as a list of words.
+        Includes a flag add_to_indexer to
         :param sentence: words in the example to featurize
-        :param add_to_indexer: True if we should grow the dimensionality of the featurizer if new features are encountered.
-        At test time, any unseen features should be discarded, but at train time, we probably want to keep growing it.
-        :return: A feature vector. We suggest using a Counter[int], which can encode a sparse feature vector (only
-        a few indices have nonzero value) in essentially the same way as a map. However, you can use whatever data
-        structure you prefer, since this does not interact with the framework code.
+        :param add_to_indexer: True if we should grow the dimensionality of the featurizer
+                               if new features are encountered. At test time, any unseen features
+                               should be discarded, but at train time, we probably want to keep growing it.
+        :return: A feature vector. We suggest using a Counter[int], which can encode a sparse
+                 feature vector (only a few indices have nonzero value) in essentially the same
+                 way as a map. However, you can use whatever data structure you prefer, since
+                 this does not interact with the framework code.
         """
         raise Exception("Don't call me, call my subclasses")
 
@@ -36,7 +62,6 @@ class FeatureExtractor(object):
 class UnigramFeatureExtractor(FeatureExtractor):
     """
     Extracts unigram bag-of-words features from a sentence.
-    :param indexer: the provided feature extractor indexer.
     """
     def __init__(self, indexer):
         self._indexer = indexer
@@ -44,70 +69,147 @@ class UnigramFeatureExtractor(FeatureExtractor):
     def get_indexer(self):
         return self._indexer
 
-    def _normalize_token(self, tok: str) -> str:
-        # lowercase and strip leading/trailing punctuation
-        if tok is None:
-            return ""
-        t = tok.lower()
-        # remove leading/trailing non-alphanumeric characters
-        t = re.sub(r'^\W+|\W+$', '', t)
-        return t
-
-    def extract_features(self, sentence: List[str], add_to_indexer: bool=False) -> Counter:
+    def extract_features(self, sentence: List[str], add_to_indexer: bool = False) -> Counter:
         """
         Returns a Counter mapping feature_index (int) -> value (float).
-        :param sentence: list of stirngs to extract features from
+        :param sentence: list of strings to extract features from
         :param add_to_indexer: Optional boolean used to grow the dimensionality of the featurizer
         """
         feats = Counter()
         # Using presence-level features (1 or 0)
-        seen = set()
+        seen_tokens = set()
         for tok in sentence:
-            t = self._normalize_token(tok)
-            if not t:
+            t = normalize_token(tok)
+            if not t or t in seen_tokens:
                 continue
-            if t in seen:
-                #skip remaining loop since presence already accounted for
-                continue
-            seen.add(t)
-
+            seen_tokens.add(t)
+            # Feature name is prefixed with "UNI"
             feat_name = f"UNI={t}"
-            # New features to be added
-            if add_to_indexer:
-                try:
-                    idx = self._indexer.add_and_get_index(feat_name)
-                except Exception as e:
-                    raise RuntimeError("Indexer does not implement add_and_get_index in utils.py") from e
-            else:
-                # Get the existing index
-                try:
-                    idx = self._indexer.index_of(feat_name)
-                except Exception as e:
-                    raise RuntimeError("Indexer does not implement get_index; inspect utils.py and update this call") from e
-
-                # if indexer returns -1, None, or a negative value for missing features, skip
-                if idx is None or (isinstance(idx, int) and idx < 0):
-                    continue
+            idx = add_feature(feat_name, self._indexer, add_to_indexer)
+            # skip missing features if indexer returns None or a negative value
+            if idx is None or (isinstance(idx, int) and idx < 0):
+                continue
             # 1.0 to signify presence
             feats[idx] += 1.0
-
         return feats
 
 
 class BigramFeatureExtractor(FeatureExtractor):
     """
     Bigram feature extractor analogous to the unigram one.
+    Extracts indicator features for adjacent word pairs (bigrams).
     """
-    def __init__(self, indexer: Indexer):
-        raise Exception("Must be implemented")
+    def __init__(self, indexer):
+        self._indexer = indexer
+
+    def get_indexer(self):
+        return self._indexer
+
+    def extract_features(self, sentence: List[str], add_to_indexer: bool = False) -> Counter:
+        """
+        Returns a Counter mapping feature_index (int) -> value (float).
+        :param sentence: list of strings to extract features from
+        :param add_to_indexer: Optional boolean used to grow the dimensionality of the featurizer
+        """
+        feats = Counter()
+        # Normalize all tokens first
+        tokens = [normalize_token(t) for t in sentence if normalize_token(t)]
+        # Using presence-level features (1 or 0)
+        seen_bigrams = set()
+        for i in range(len(tokens) - 1):
+            # Build bigram by combining current token and the next token
+            bigram = f"{tokens[i]}_{tokens[i+1]}"
+            if bigram in seen_bigrams:
+                continue
+            seen_bigrams.add(bigram)
+            # Feature name is prefixed with "BI"
+            feat_name = f"BI={bigram}"
+            # skip missing features if indexer returns None or a negative value
+            idx = add_feature(feat_name, self._indexer, add_to_indexer)
+            if idx is None or (isinstance(idx, int) and idx < 0):
+                continue
+            # 1.0 to signify presence                
+            feats[idx] += 1.0
+        return feats
 
 
 class BetterFeatureExtractor(FeatureExtractor):
     """
-    Better feature extractor...try whatever you can think of!
+    Improved feature extractor using:
+    - Unigram features
+    - NLTK Stopword removal
+    - TF-IDF weighting
     """
-    def __init__(self, indexer: Indexer):
-        raise Exception("Must be implemented")
+    def __init__(self, indexer: Indexer, train_exs: List[SentimentExample] = None):
+        """
+        :param train_exs: Unique to BetterFeatureExtractor,
+                          training examples are needed to compute document frequencies at initialization
+        """
+        self._indexer = indexer
+        # Use NLTK’s stopwords
+        self.stopwords = set(stopwords.words("english"))
+        # Define dictionary for mapping token -> IDF score
+        self.idf = {}
+
+        if train_exs is not None:
+            # Counter for tracking document frequencies for each token
+            doc_freqs = Counter()
+            # Loop through training examples
+            for ex in train_exs:
+                seen_tokens = set()
+                for tok in ex.words:
+                    t = normalize_token(tok)
+                    # Skip empty tokens and stopwords
+                    if not t or t in self.stopwords:
+                        continue
+                    seen_tokens.add(t)
+                # Increment DF for every token seen in document
+                for t in seen_tokens:
+                    doc_freqs[t] += 1
+            # total number of documents
+            num_docs = len(train_exs)
+            # Convert DF to smooth IDF to avoid errors when a token doesn't appear
+            for tok, df in doc_freqs.items():
+                self.idf[tok] = np.log((num_docs + 1.0) / (df + 1.0)) + 1.0
+
+    def get_indexer(self):
+        return self._indexer
+
+    def extract_features(self, sentence: List[str], add_to_indexer: bool = False) -> Counter:
+        """
+        Extract TF-IDF weighted unigram features for a sentence.
+        :param sentence: list of stirngs to extract features from
+        :param add_to_indexer: Optional boolean used to grow the dimensionality of the featurizer
+        :return: Counter mapping feature_index (int) -> TF-IDF value (float)
+        """
+        # Features counter
+        feats = Counter()
+        # Term frequency counter
+        tf_counts = Counter()
+        # Count token frequencies
+        for tok in sentence:
+            t = normalize_token(tok)
+            # Skip empty tokens and stopwords
+            if not t or t in self.stopwords:
+                continue
+            tf_counts[t] += 1
+        # Convert counts into TF-IDF values
+        for tok, tf in tf_counts.items():
+            # Look up IDF value for this token; if not found, default to 0          
+            idf_val = self.idf.get(tok, 0.0)
+            # If the token never appeared in training, skip            
+            if idf_val == 0.0:
+                continue
+            # Create feature name with prefix "UNI"                
+            feat_name = f"UNI={tok}"
+            # add/skip missing features
+            idx = add_feature(feat_name, self._indexer, add_to_indexer)
+            # Skip if index not found            
+            if idx is None or idx < 0:
+                continue
+            # Calculate TF-IDF weight = (term frequency) * (inverse document frequency)                
+            feats[idx] = tf * idf_val
+        return feats
 
 
 class SentimentClassifier(object):
@@ -165,7 +267,7 @@ class LogisticRegressionClassifier(SentimentClassifier):
         """
         Compute the linear score w · x for a sentence.
         :param sentence: List of strings to be scored
-        :return: float: sparse dot procut score
+        :return: float: sparse dot product score
         """
         feats = self.feat_extractor.extract_features(sentence, add_to_indexer=False)
         s = 0.0
@@ -178,14 +280,14 @@ class LogisticRegressionClassifier(SentimentClassifier):
 
     def _sigmoid(self, x: float) -> float:
         """
-        Numerically stable sigmoid function. 
+        Numerically stable sigmoid function.
         :param x: raw score value (w · x).
         :return: float: Sigmoid output representing probability (between 0 and 1).
         """
         if x >= 0:
-          return 1.0 / (1.0 + np.exp(-x))
+            return 1.0 / (1.0 + np.exp(-x))
         else:
-          return np.exp(x) / (np.exp(x) + 1.0)
+            return np.exp(x) / (np.exp(x) + 1.0)
 
     def predict_scores(self, sentence: List[str]) -> float:
         """
@@ -225,8 +327,8 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
         features_cache.append(feats)
         if len(feats) > 0:
             max_index = max(max_index, max(feats.keys()))
-
     dim = max_index + 1 if max_index >= 0 else 0
+
     # initialize weights
     weights = np.zeros(dim, dtype=float)
 
@@ -234,8 +336,9 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
     # random.seed(0)
 
     for epoch in range(NUM_EPOCHS):
-        # adjust learning rate (slight decay) 
+        # adjust learning rate (slight decay)
         eta = INITIAL_LEARNING_RATE / (1.0 + epoch * 0.1)
+
         # shuffle indices for random order each epoch
         indices = list(range(len(train_exs)))
         random.shuffle(indices)
@@ -248,9 +351,11 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
             for idx, val in feats.items():
                 if 0 <= idx < weights.shape[0]:
                     score += weights[idx] * val
+
             # Map gold label 0/1 to perceptron targets y = -1 or +1
             gold_label = train_exs[i].label
             y = 1 if gold_label == 1 else -1
+
             # Predicted label
             pred_y = 1 if score > 0.0 else -1
 
@@ -268,6 +373,7 @@ def train_perceptron(train_exs: List[SentimentExample], feat_extractor: FeatureE
             pred = 1 if s > 0.0 else 0
             if pred == ex.label:
                 correct += 1
+
         # Print epoch, train accuracy and eta
         train_acc = correct / len(train_exs)
         print(f"[Epoch {epoch+1}/{NUM_EPOCHS}] train_acc={train_acc:.4f} eta={eta:.4f}")
@@ -296,12 +402,12 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
         features_cache.append(feats)
         if len(feats) > 0:
             max_index = max(max_index, max(feats.keys()))
-    
-    # set weight vector dimensionality and intialize weights
+
+    # set weight vector dimensionality and initialize weights
     dim = max_index + 1 if max_index >= 0 else 0
     weights = np.zeros(dim, dtype=float)
 
-    # Wrap weights + feature extractor in classifier 
+    # Wrap weights + feature extractor in classifier
     clf = LogisticRegressionClassifier(weights, feat_extractor)
 
     # Training loop
@@ -314,11 +420,9 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
             feats = features_cache[i]
             # gold label (0 or 1)
             y = train_exs[i].label
-
             # Compute probability
             score = clf._score(train_exs[i].words)
             p = clf._sigmoid(score)
-
             # Gradient update: w <- w + lr * (y - p) * x
             for idx, val in feats.items():
                 if 0 <= idx < clf.weights.shape[0]:
@@ -334,12 +438,14 @@ def train_logistic_regression(train_exs: List[SentimentExample], feat_extractor:
 
 def train_model(args, train_exs: List[SentimentExample], dev_exs: List[SentimentExample]) -> SentimentClassifier:
     """
-    Main entry point for your modifications. Trains and returns one of several models depending on the args
-    passed in from the main method. You may modify this function, but probably will not need to.
+    Main entry point for your modifications.
+    Trains and returns one of several models depending on the args passed in from the main method.
+    You may modify this function, but probably will not need to.
     :param args: args bundle from sentiment_classifier.py
     :param train_exs: training set, List of SentimentExample objects
-    :param dev_exs: dev set, List of SentimentExample objects. You can use this for validation throughout the training
-    process, but you should *not* directly train on this data.
+    :param dev_exs: dev set, List of SentimentExample objects.
+                    You can use this for validation throughout the training process,
+                    but you should *not* directly train on this data.
     :return: trained SentimentClassifier model, of whichever type is specified
     """
     # Initialize feature extractor
@@ -352,8 +458,8 @@ def train_model(args, train_exs: List[SentimentExample], dev_exs: List[Sentiment
         # Add additional preprocessing code here
         feat_extractor = BigramFeatureExtractor(Indexer())
     elif args.feats == "BETTER":
-        # Add additional preprocessing code here
-        feat_extractor = BetterFeatureExtractor(Indexer())
+        # Training examples are passed to compute IDF
+        feat_extractor = BetterFeatureExtractor(Indexer(), train_exs)
     else:
         raise Exception("Pass in UNIGRAM, BIGRAM, or BETTER to run the appropriate system")
 
@@ -366,4 +472,5 @@ def train_model(args, train_exs: List[SentimentExample], dev_exs: List[Sentiment
         model = train_logistic_regression(train_exs, feat_extractor)
     else:
         raise Exception("Pass in TRIVIAL, PERCEPTRON, or LR to run the appropriate system")
+
     return model
