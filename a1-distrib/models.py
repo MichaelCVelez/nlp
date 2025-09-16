@@ -16,7 +16,7 @@ from sentiment_data import *
 from utils import *
 
 
-# ---------------- Helper functions (new, added for modularity) ----------------
+# ---------------- Helper Functions --------------------------------------------
 def normalize_token(tok: str) -> str:
     # lowercase and strip leading/trailing punctuation
     if tok is None:
