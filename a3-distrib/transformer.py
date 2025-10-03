@@ -1,11 +1,17 @@
+# Assignment 3 Fall 2025 
+# Note: ChatGPT used to understand concepts and as a coding assistant 
+# - Michael Velez
 # transformer.py
 
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 import numpy as np
 import random
 from torch import optim
+from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from typing import List
 from utils import *
@@ -39,16 +45,56 @@ class Transformer(nn.Module):
         :param num_layers: number of TransformerLayers to use; can be whatever you want
         """
         super().__init__()
-        raise Exception("Implement me")
+        # Converts each character index -> continuous vector
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        # Adds positional info to embeddings (uses batching)
+        self.pos_encoder = PositionalEncoding(d_model, num_positions=num_positions, batched=True)
+        # Stack of Transformer layers
+        self.layers = nn.ModuleList([TransformerLayer(d_model, d_internal) for _ in range(num_layers)])
+        # Project model output to label logits
+        self.classifier = nn.Linear(d_model, num_classes)
+        self.model_dim = d_model
+        self.max_positions = num_positions
 
-    def forward(self, indices):
+    def forward(self, indices, causal=False):
         """
 
         :param indices: list of input indices
-        :return: A tuple of the softmax log probabilities (should be a 20x3 matrix) and a list of the attention
-        maps you use in your layers (can be variable length, but each should be a 20x20 matrix)
+        :param causal: prevents a token from “looking ahead” before predicting
+        :return: A tuple of the softmax log probabilities and a list of the attention maps.
         """
-        raise Exception("Implement me")
+        # Add a batch dimension if necessary
+        is_unbatched = False
+        if indices.dim() == 1:
+            indices = indices.unsqueeze(0)
+            is_unbatched = True
+
+        device = next(self.parameters()).device
+        indices = indices.to(device)
+
+        # shape (B, T, D)
+        token_embeddings = self.token_embedding(indices)
+
+        # Add positional info
+        encoded_inputs = self.pos_encoder(token_embeddings)
+        # Used for visualization
+        attention_maps = []
+        # Pass through Transformer layers 
+        for transformer_layer in self.layers:
+            # return (B, T, D) and attention (B, T, T)
+            encoded_inputs, attention_weights = transformer_layer(encoded_inputs, causal=causal)
+            attention_maps.append(attention_weights)
+
+        # Classify each token
+        logits = self.classifier(encoded_inputs)
+        # Convert logits to log-probabilities for NLLLoss
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        # Squeeze batch to match unbatched shape
+        if is_unbatched:
+            log_probs = log_probs.squeeze(0)
+            attention_maps = [attn.squeeze(0) for attn in attention_maps]
+        return log_probs, attention_maps
 
 
 # Your implementation of the Transformer layer goes here. It should take vectors and return the same number of vectors
@@ -62,10 +108,59 @@ class TransformerLayer(nn.Module):
         should both be of this length.
         """
         super().__init__()
-        raise Exception("Implement me")
+        # attention components without bias
+        self.query_projection = nn.Linear(d_model, d_internal, bias=False)
+        self.key_projection = nn.Linear(d_model, d_internal, bias=False)
+        self.value_projection = nn.Linear(d_model, d_model, bias=False)
+        # project context back into model dimension
+        self.output_projection = nn.Linear(d_model, d_model)
+        # Feed-forward network
+        self.feedforward1 = nn.Linear(d_model, d_internal)
+        self.feedforward2 = nn.Linear(d_internal, d_model)
+        # Activation between layers
+        self.activation = nn.ReLU()
 
-    def forward(self, input_vecs):
-        raise Exception("Implement me")
+    def forward(self, input_vecs, causal: bool = False):
+        """
+        Single-layer forward pass implementing 
+        - self-attention + residual
+        - feed-forward + residual
+
+        :param input_vecs: (B, T, d_model)
+        :param causal: if True, prevents a token from attending to future tokens by setting scores to -inf
+        :return: (out, attn) where out is (B, T, d_model) and attn is (B, T, T)
+        """
+        batch_size, seq_length, model_dim = input_vecs.shape
+
+        # Compute projections
+        query = self.query_projection(input_vecs)
+        key = self.key_projection(input_vecs)
+        value = self.value_projection(input_vecs)
+
+        # Get attention scores using scaled dot-product
+        key_dim = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(key_dim)
+
+        if causal:
+            # Mask future positions with a large negative number
+            causal_mask = torch.triu(torch.ones((seq_length, seq_length), dtype=torch.bool, device=input_vecs.device), diagonal=1)
+            scores = scores.masked_fill(causal_mask.unsqueeze(0), float('-1e9'))
+
+        # Softmax the keys dimension to get attention weights that sum to 1
+        attention_weights = F.softmax(scores, dim=-1)
+
+        # Get context using matmul
+        context = torch.matmul(attention_weights, value)
+
+        # Adds input back after attention (residual)
+        context = self.output_projection(context)
+        residual = input_vecs + context
+
+        # FFN applied per position followed by second residual
+        feedforward_output = self.feedforward2(self.activation(self.feedforward1(residual)))
+        output = residual + feedforward_output
+
+        return output, attention_weights
 
 
 # Implementation of positional encoding that you can use in your network
@@ -91,7 +186,8 @@ class PositionalEncoding(nn.Module):
         """
         # Second-to-last dimension will always be sequence length
         input_size = x.shape[-2]
-        indices_to_embed = torch.tensor(np.asarray(range(0, input_size))).type(torch.LongTensor)
+        # Create position indices avoid device mismatch (GPU/CPU)
+        indices_to_embed = torch.arange(0, input_size, device=x.device).long()
         if self.batched:
             # Use unsqueeze to form a [1, seq len, embedding dim] tensor -- broadcasting will ensure that this
             # gets added correctly across the batch
@@ -101,32 +197,162 @@ class PositionalEncoding(nn.Module):
             return x + self.emb(indices_to_embed)
 
 
+class LetterDataset(Dataset):
+    """
+    Dataset wrapper for LetterCountingExample objects.
+    """
+    def __init__(self, examples):
+        self.examples = examples
+
+    def __len__(self):
+        return len(self.examples)
+    
+    def __getitem__(self, idx):
+        ex = self.examples[idx]
+        return ex.input_tensor, ex.output_tensor
+
 # This is a skeleton for train_classifier: you can implement this however you want
 def train_classifier(args, train, dev):
-    raise Exception("Not fully implemented yet")
+    """
+    Trains a simple Transformer classifier on the letter counting examples.
 
-    # The following code DOES NOT WORK but can be a starting point for your implementation
-    # Some suggested snippets to use:
-    model = Transformer(...)
-    model.zero_grad()
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
+    :param args: parsed arguments from letter_counting.py
+    :param train: list of LetterCountingExample
+    :param dev: list of LetterCountingExample (dev examples)
+    :return: trained Transformer model moved to CPU for decode()
+    """
+    # Hyperparameters
+    num_positions = 20
+    num_classes = 3
+    d_model = 64
+    d_internal = 32
+    num_layers = 2
+    learning_rate = 1e-3
+    batch_size = 128
     num_epochs = 10
-    for t in range(0, num_epochs):
-        loss_this_epoch = 0.0
-        random.seed(t)
-        # You can use batching if you'd like
-        ex_idxs = [i for i in range(0, len(train))]
-        random.shuffle(ex_idxs)
-        loss_fcn = nn.NLLLoss()
-        for ex_idx in ex_idxs:
-            loss = loss_fcn(...) # TODO: Run forward and compute loss
-            # model.zero_grad()
-            # loss.backward()
-            # optimizer.step()
-            loss_this_epoch += loss.item()
+    
+    # 26 letters + special token
+    vocab_size = 27
+    if len(train) > 0:
+        # Expands vocab if needed
+        max_idx = max([int(np.max(example.input_indexed)) for example in train])
+        vocab_size = max(vocab_size, max_idx + 1)
+
+    # Use GPU if available otherwise CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Build Transformer model
+    model = Transformer(vocab_size=vocab_size,
+                        num_positions=num_positions,
+                        d_model=d_model,
+                        d_internal=d_internal,
+                        num_classes=num_classes,
+                        num_layers=num_layers).to(device)
+
+    # Update model weights
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    # Scheduler halves the learning rate every 10 steps
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    # Negative Log Likelihood used as loss function for classification
+    criterion = nn.NLLLoss()
+
+    # Boolean for if "BEFORE" is passed use a causal mask to only see previous tokens
+    count_only_previous = True if args.task == "BEFORE" else False
+    
+    def evaluate_model(model, examples, use_causal_mask):
+        """
+        Check how well the model predicts labels without updating weights
+        """
+        # Switch to evaluation mode        
+        model.eval()
+        correct = 0
+        total = 0
+        # Disable gradient tracking for speed
+        with torch.no_grad():
+            for example in examples:
+                # Add batch dimension
+                input_tensor = example.input_tensor.unsqueeze(0).to(device)  
+                labels = example.output_tensor.unsqueeze(0).to(device)
+                # Forward pass through model
+                log_probs, _ = model.forward(input_tensor, causal=use_causal_mask)
+                # Pick class with the highest log probability
+                predictions = log_probs.argmax(dim=-1)
+                # Count correct predictions
+                correct += (predictions == labels).sum().item()
+                total += labels.numel()
+        # Return accuracy
+        return correct / total if total > 0 else 0.0
+
+    # Wrap training data in a Dataset and DataLoader
+    train_dataset = LetterDataset(train)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # Initial test for overfitting using a smaller batch
+    if len(train) >= 64:
+        model.train()
+        # Only first 64 examples
+        small_subset = train[:64]
+        small_loader = DataLoader(LetterDataset(small_subset), batch_size=32, shuffle=True)
+        print("Running overfit test on 64 examples for 10 iterations...")
+        for _ in range(10):
+            for small_inputs, small_labels in small_loader:
+                # Move data to device
+                small_inputs = small_inputs.to(device)
+                small_labels = small_labels.to(device)
+                # Reset gradients
+                optimizer.zero_grad()
+                # Forward pass
+                log_probs_small, _ = model.forward(small_inputs, causal=count_only_previous)
+                B_s, T_s, C_s = log_probs_small.shape
+                # Compute loss (reshape for NLLLoss)
+                loss_small = criterion(log_probs_small.view(B_s * T_s, C_s),
+                                       small_labels.view(B_s * T_s))
+                # Backpropagation
+                loss_small.backward()
+                optimizer.step()
+        # Check and print accuracy for examples
+        overfit_acc = evaluate_model(model, small_subset, count_only_previous)
+        print("Overfit test accuracy (64 exs): %.4f" % overfit_acc)
+
+    # ---------------------------
+    # Main training loop
+    # ---------------------------
+    for epoch in range(num_epochs):
+        # Switch to training mode
+        model.train()
+        total_loss = 0.0
+        for batch_inputs, batch_labels in train_loader:
+            # Move batch to device
+            batch_inputs = batch_inputs.to(device)   
+            batch_labels = batch_labels.to(device)   
+            # Reset gradients
+            optimizer.zero_grad()            
+            # Forward pass
+            log_probs, _ = model.forward(batch_inputs, causal=count_only_previous)
+            B, T, C = log_probs.shape
+            # Compute loss (reshape to 2D for NLLLoss)
+            loss = criterion(log_probs.view(B * T, C), batch_labels.view(B * T))
+            # Backpropagation
+            loss.backward()
+            # Clip gradients to prevent exploding gradients and update weights
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            # Accumulate loss scaled by batch size
+            total_loss += loss.item() * batch_inputs.size(0)
+
+        # Step the learning rate scheduler
+        scheduler.step()
+        # Compute and print average loss for the epoch
+        avg_loss = total_loss / len(train) if len(train) > 0 else 0.0
+        print("Epoch %d/%d - avg_loss=%.6f" % (epoch + 1, num_epochs, avg_loss))
+
+        # Evaluate on dev set and print accuracy
+        dev_acc = evaluate_model(model, dev, count_only_previous)
+        print("Dev accuracy: %.4f" % dev_acc)
+    # Eval mode
     model.eval()
+    # Move to CPU for decoding use    
+    model.to(torch.device('cpu'))
     return model
 
 
