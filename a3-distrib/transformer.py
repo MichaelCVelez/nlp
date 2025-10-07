@@ -54,7 +54,7 @@ class Transformer(nn.Module):
         # Project model output to label logits
         self.classifier = nn.Linear(d_model, num_classes)
         self.model_dim = d_model
-        self.max_positions = num_positions
+        self.num_positions = num_positions
 
     def forward(self, indices, causal=False):
         """
