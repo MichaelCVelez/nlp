@@ -257,7 +257,7 @@ def train_classifier(args, train, dev):
     criterion = nn.NLLLoss()
 
     # Boolean for if "BEFORE" is passed use a causal mask to only see previous tokens
-    count_only_previous = True if args.task == "BEFORE" else False
+    count_only_previous = (getattr(args, "task", "BEFORE").upper() == "BEFORE")
     
     def evaluate_model(model, examples, use_causal_mask):
         """

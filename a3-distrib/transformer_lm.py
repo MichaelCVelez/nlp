@@ -163,12 +163,12 @@ def train_lm(args, train_text: str, dev_text: str, vocab_index):
     """
     
     # Hyperparameters
-    seq_len = getattr(args, "seq_len", 128)
+    seq_len = getattr(args, "seq_len", 64)
     num_positions = seq_len
     d_model = getattr(args, "d_model", 128)
     d_internal = getattr(args, "d_internal", 256)
     num_layers = getattr(args, "num_layers", 2)
-    batch_size = getattr(args, "batch_size", 128)
+    batch_size = min(getattr(args, "batch_size", 64), 64)
     num_epochs = getattr(args, "epochs", 15)
     learning_rate = getattr(args, "lr", 1e-3)
     step = getattr(args, "step", seq_len // 4)
@@ -187,7 +187,7 @@ def train_lm(args, train_text: str, dev_text: str, vocab_index):
             max_idx = max([vocab_index.index_of(c) for c in train_text])
             vocab_size = max(27, max_idx + 1)
         else:
-        # Fallback to 27 (alphabet + space characters)
+            # Fallback to 27 (alphabet + space characters)
             vocab_size = 27
 
     # Use GPU if available
@@ -212,20 +212,20 @@ def train_lm(args, train_text: str, dev_text: str, vocab_index):
     train_dataset = CharChunkDataset(train_text, vocab_index, seq_len=seq_len, step=step)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    # Initial overfit test 
+    # Initial overfit test
     if len(train_dataset) >= 64:
         model.train()
-        # Up to 32 randomized samples per batch    
-        small_loader = DataLoader(train_dataset, batch_size=min(32, len(train_dataset)), shuffle=True)
+        # Up to 16 randomized samples per batch
+        small_loader = DataLoader(train_dataset, batch_size=min(16, len(train_dataset)), shuffle=True)
         print("Running overfit test on a small training subset to sanity-check...")
-        # Perform 3x gradient updates to model weights before main training
-        for _ in range(3):
+        # Perform a couple of gradient updates to model weights before main training
+        for _ in range(2):
             for inputs_tensor, targets_tensor in small_loader:
                 # Move to GPU
                 inputs_tensor = inputs_tensor.to(device)
                 targets_tensor = targets_tensor.to(device)
                 # Reset gradients
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 log_probs, _ = model.forward(inputs_tensor, causal=True)
                 # Get shape (B, T, V)
                 batch_size_dim, seq_len_dim, vocab_size_dim = log_probs.shape
@@ -238,6 +238,10 @@ def train_lm(args, train_text: str, dev_text: str, vocab_index):
                 # Prevent gradient explosion
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                # Free computation graph between iterations
+                del loss
+        # clear unused memory
+        torch.cuda.empty_cache() 
 
     # ---------------------------
     # Main training loop
@@ -260,7 +264,7 @@ def train_lm(args, train_text: str, dev_text: str, vocab_index):
             batch_inputs = batch_inputs.to(device)
             batch_targets = batch_targets.to(device)
             # Clear gradients
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             # Get log-probabilities for NLLLoss
             log_probs, _ = model.forward(batch_inputs, causal=True)
             # (Batch size, Time steps, Vocabulary size) or (B, T, V)
@@ -280,6 +284,10 @@ def train_lm(args, train_text: str, dev_text: str, vocab_index):
             optimizer.step()
             # Accumulate loss across all batches
             epoch_loss += loss.item() * batch_inputs.size(0)
+             # Cleanup to avoid graph buildup
+            del loss
+        # Clear memory cache
+        torch.cuda.empty_cache()
 
         # Decay LR every 4 epochs
         scheduler.step()
